@@ -4,14 +4,18 @@
     <TargetFramework>net5.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <Content Remove="EasyHttp\**" />
+    <EmbeddedResource Remove="EasyHttp\**" />
+  </ItemGroup>
+  <ItemGroup>
     <Compile Include="Main.fs" />
     <Compile Include="Startup.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Bolero" Version="0.*" />
     <PackageReference Include="Bolero.Build" Version="0.*" />
-    <PackageReference Include="FsEasyHttp" Version="2.0.1" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="5.0.*" />
     <PackageReference Include="Ply" Version="0.3.1" />
+    <ProjectReference Include="EasyHttp\EasyHttp.fsproj" />
   </ItemGroup>
 </Project>

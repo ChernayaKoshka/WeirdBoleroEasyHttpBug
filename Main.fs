@@ -9,6 +9,13 @@ open System
 open EasyHttp
 open System.Net.Http
 open Microsoft.Extensions.DependencyInjection
+open System.IO
+open Microsoft.FSharp.Reflection
+open FSharp.Reflection
+open System.Text.Json
+open EasyHttp.Serializers
+open System.Text
+open System.IO
 
 type Response =
     {
@@ -31,14 +38,18 @@ type Page =
 | EasyHttpPage
 | EasyHttpWrappedPage
 | DirectClientPage
+| DynamicTaskPage
+| SendDirectPage
+| SendIndirectPage
 
 type Model =
     {
         api: Api
         client: HttpClient
         page: Page
-        x: string
+        pageText: string
     }
+
 
 let initModel (hcf: IHttpClientFactory) =
     let client = hcf.CreateClient()
@@ -47,18 +58,64 @@ let initModel (hcf: IHttpClientFactory) =
         | Ok api -> api
         | Error err -> failwith err
 
+
     {
         api = api
         client = client
         page = Home
-        x = "Press the button"
+        pageText = "Click any links below"
     }, Cmd.none
-    
+
+let test() = task {
+    do! Task.Delay(750)
+    return 5
+}
+let makeFunc() =
+    FSharpValue.MakeFunction(typeof<unit -> Task<int>>, fun arg -> (arg :?> unit) |> test :> obj)
+let dynamicallyCreatedTask = makeFunc() :?> unit -> Task<int>
+
+// #3 Fix: calling send directly
+let send (client: HttpClient) (method: HttpMethod) (serializationType: SerializationType) (requestUri: Uri) (uriFragment: string) (content: obj) : Task<'ReturnType> = task {
+    let! response =
+        match serializationType with
+        | JsonSerialization ->
+            let requestUri = Uri(requestUri, uriFragment)
+            // TODO: Allow JsonSerializer to house serialization options? How would that work with an Attribute?
+            let content = JsonSerializer.Serialize(content)
+            new HttpRequestMessage(method, requestUri,
+                Content = new StringContent(content, Encoding.UTF8, "application/json")
+            )
+        | PathStringSerialization ->
+            let uriFragment =
+                match PathString.serialize uriFragment content with
+                | Ok fragment -> fragment
+                | Error err -> failwith err
+            let requestUri = Uri(requestUri, uriFragment)
+            new HttpRequestMessage(method, requestUri)
+        |> client.SendAsync
+    if typeof<'ReturnType> = typeof<unit> then
+        return box () :?> 'ReturnType
+
+    else
+    let! stream = response.Content.ReadAsStreamAsync()
+    if typeof<'ReturnType> = typeof<string> then
+        use reader = new StreamReader(stream)
+        let! body = reader.ReadToEndAsync()
+        return box body :?> 'ReturnType
+
+    else
+    return! JsonSerializer.DeserializeAsync<'ReturnType>(stream)
+}
+
+let sendDirect client =  send client HttpMethod.Get PathStringSerialization Api.BaseUri "" (box null)
+
 type Message =
     | SetPage of Page
     | LaunchEasyHttpTask
     | LaunchDirectClientTask
     | LaunchEasyHttpWrappedTask
+    | LaunchDynamicTask
+    | LaunchSendDirectTask
     | SetText of string
 
 let router = Router.infer SetPage (fun m -> m.page)
@@ -73,19 +130,23 @@ let directClientTask (hc: HttpClient) = task {
 let update message model =
     match message with
     | SetPage page ->
-        let nextCmd = 
+        let nextCmd =
             match page with
-            | EasyHttpPage -> 
+            | EasyHttpPage ->
                 Cmd.ofMsg LaunchEasyHttpTask
-            | EasyHttpWrappedPage -> 
+            | EasyHttpWrappedPage ->
                 Cmd.ofMsg LaunchEasyHttpWrappedTask
-            | DirectClientPage -> 
+            | DirectClientPage ->
                 Cmd.ofMsg LaunchDirectClientTask
-            | _ -> 
+            | DynamicTaskPage ->
+                Cmd.ofMsg LaunchDynamicTask
+            | SendDirectPage ->
+                Cmd.ofMsg LaunchSendDirectTask
+            | _ ->
                 Cmd.none
         { model with
             page = page
-            x = ""
+            pageText = ""
         }, nextCmd
     | LaunchEasyHttpTask ->
         model, Cmd.OfTask.either model.api.test () (string >> SetText) (string >> SetText)
@@ -93,20 +154,26 @@ let update message model =
         model, Cmd.OfTask.either (fun () -> task { return! model.api.test () }) () (string >> SetText) (string >> SetText)
     | LaunchDirectClientTask ->
         model, Cmd.OfTask.either directClientTask model.client (string >> SetText) (string >> SetText)
-    | SetText str -> 
-        { model with 
-            x = str 
+    | LaunchDynamicTask ->
+        model, Cmd.OfTask.either dynamicallyCreatedTask () (string >> SetText) (string >> SetText)
+    | LaunchSendDirectTask ->
+        model, Cmd.OfTask.either sendDirect model.client (string >> SetText) (string >> SetText)
+    | SetText str ->
+        { model with
+            pageText = str
         }, Cmd.none
 
 let view model dispatch =
     div [ ] [
-        p [ ] [ 
-            text model.x 
+        p [ ] [
+            text model.pageText
         ]
-        p [ ] [ 
+        p [ ] [
             button [ on.click (fun _ -> dispatch LaunchEasyHttpTask) ] [ text "LaunchEasyHttpTask Directly" ]
             button [ on.click (fun _ -> dispatch LaunchEasyHttpWrappedTask) ] [ text "LaunchEasyHttpWrappedTask Directly" ]
             button [ on.click (fun _ -> dispatch LaunchDirectClientTask) ] [ text "LaunchDirectClientTask Directly" ]
+            button [ on.click (fun _ -> dispatch LaunchDynamicTask) ] [ text "LaunchDynamicTask Directly" ]
+            button [ on.click (fun _ -> dispatch LaunchSendDirectTask) ] [ text "LaunchSendDirectTask Directly" ]
         ]
         if model.page = Home then text "blah"
         hr [ ]
@@ -114,15 +181,15 @@ let view model dispatch =
 
         // clicking this will cause an error in the console and the task result not to be sent out
         // navigating to /OtherPage directly doesn't cause this issue
-        p [ ] [ a [ router.HRef EasyHttpPage ] [ text "EasyHttpPage" ] ]
+        p [ ] [ a [ router.HRef EasyHttpPage ] [ text "EasyHttpPage (breaks, error in console on FireFox)" ] ]
 
-        // not this, though?
+        // not these, though?
         p [ ] [ a [ router.HRef EasyHttpWrappedPage ] [ text "EasyHttpWrappedPage" ] ]
-
-        // not this, though?
         p [ ] [ a [ router.HRef DirectClientPage ] [ text "DirectClientPage" ] ]
+        p [ ] [ a [ router.HRef DynamicTaskPage ] [ text "DynamicTaskPage" ] ]
+        p [ ] [ a [ router.HRef SendDirectPage ] [ text "SendDirectPage" ] ]
     ]
-    
+
 
 type MyApp() =
     inherit ProgramComponent<Model, Message>()
