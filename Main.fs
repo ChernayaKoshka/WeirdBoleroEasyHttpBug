@@ -4,128 +4,62 @@ open Elmish
 open Bolero
 open Bolero.Html
 open System.Threading.Tasks
-open FSharp.Control.Tasks
 open System
-open EasyHttp
-open System.Net.Http
-open Microsoft.Extensions.DependencyInjection
-open System.IO
 open Microsoft.FSharp.Reflection
-open FSharp.Reflection
-open System.Text.Json
-open EasyHttp.Serializers
-open System.Text
-open System.IO
 
-type Response =
-    {
-        Method: string
-        Path: string
-        QueryString: string
-        Content: string
+// using TaskBuilder.fs over Ply fixes the issue
+open FSharp.Control.Tasks.NonAffine //.V2.ContextInsensitive
+
+type FunctionHolder private () =
+    static member Test (arg1: obj) : Task<string> = task {
+        return (string arg1)
     }
 
-type Api =
-    {
-        [<Method("GET")>]
-        test: unit -> Task<string>
-    }
-    with
-        static member BaseUri = Uri("https://jsonplaceholder.typicode.com/users")
+// being `inline` somehow contributes to the issue
+let inline makeBreakingFunction (testArg: Uri) =
+    let returnType = typeof<unit -> Task<string>>
+    FSharpValue.MakeFunction(
+        returnType,
+        fun arg ->
+            // If the last argument passed in is `null`, you get an `Uncaught Error: undefined` exception in FireFox
+            // dynamic invocation is the key here, it seems.
+
+            let res = typeof<FunctionHolder>.GetMethod(nameof FunctionHolder.Test).Invoke(null, [| null |])
+            // let res = typeof<Http>.GetMethod(nameof Http.Send).Invoke(null, [| "I'm not null!" |])
+
+            // if you uncomment the next line it inexplicably fixes the `Uncaught Error: undefined` exception in FireFox even if the last argument is null
+            // let arbitrary = Math.Abs(2)
+            box res
+    )
+    :?> unit -> Task<string>
 
 type Page =
 | Home
 | EasyHttpPage
-| EasyHttpWrappedPage
-| DirectClientPage
-| DynamicTaskPage
-| SendDirectPage
-| SendIndirectPage
 
 type Model =
     {
-        api: Api
-        client: HttpClient
+        breaks: unit -> Task<string>
         page: Page
         pageText: string
     }
 
+type Message =
+    | SetPage of Page
+    | LaunchBreakingTask
+    | SetText of string
 
-let initModel (hcf: IHttpClientFactory) =
-    let client = hcf.CreateClient()
-    let api =
-        match makeApi<Api> client with
-        | Ok api -> api
-        | Error err -> failwith err
-
+let initModel =
+    let breaks = makeBreakingFunction (Uri("https://blah.com"))
 
     {
-        api = api
-        client = client
+        breaks = breaks
         page = Home
         pageText = "Click any links below"
     }, Cmd.none
 
-let test() = task {
-    do! Task.Delay(750)
-    return 5
-}
-let makeFunc() =
-    FSharpValue.MakeFunction(typeof<unit -> Task<int>>, fun arg -> (arg :?> unit) |> test :> obj)
-let dynamicallyCreatedTask = makeFunc() :?> unit -> Task<int>
-
-// #3 Fix: calling send directly
-let send (client: HttpClient) (method: HttpMethod) (serializationType: SerializationType) (requestUri: Uri) (uriFragment: string) (content: obj) : Task<'ReturnType> = task {
-    let! response =
-        match serializationType with
-        | JsonSerialization ->
-            let requestUri = Uri(requestUri, uriFragment)
-            // TODO: Allow JsonSerializer to house serialization options? How would that work with an Attribute?
-            let content = JsonSerializer.Serialize(content)
-            new HttpRequestMessage(method, requestUri,
-                Content = new StringContent(content, Encoding.UTF8, "application/json")
-            )
-        | PathStringSerialization ->
-            let uriFragment =
-                match PathString.serialize uriFragment content with
-                | Ok fragment -> fragment
-                | Error err -> failwith err
-            let requestUri = Uri(requestUri, uriFragment)
-            new HttpRequestMessage(method, requestUri)
-        |> client.SendAsync
-    if typeof<'ReturnType> = typeof<unit> then
-        return box () :?> 'ReturnType
-
-    else
-    let! stream = response.Content.ReadAsStreamAsync()
-    if typeof<'ReturnType> = typeof<string> then
-        use reader = new StreamReader(stream)
-        let! body = reader.ReadToEndAsync()
-        return box body :?> 'ReturnType
-
-    else
-    return! JsonSerializer.DeserializeAsync<'ReturnType>(stream)
-}
-
-let sendDirect client =  send client HttpMethod.Get PathStringSerialization Api.BaseUri "" (box null)
-
-type Message =
-    | SetPage of Page
-    | LaunchEasyHttpTask
-    | LaunchDirectClientTask
-    | LaunchEasyHttpWrappedTask
-    | LaunchDynamicTask
-    | LaunchSendDirectTask
-    | SetText of string
 
 let router = Router.infer SetPage (fun m -> m.page)
-
-let directClientTask (hc: HttpClient) = task {
-    let! response = hc.GetAsync(Uri("https://jsonplaceholder.typicode.com/users"))
-    let! stream = response.Content.ReadAsStreamAsync()
-    use reader = new System.IO.StreamReader(stream)
-    return! reader.ReadToEndAsync()
-}
 
 let update message model =
     match message with
@@ -133,31 +67,15 @@ let update message model =
         let nextCmd =
             match page with
             | EasyHttpPage ->
-                Cmd.ofMsg LaunchEasyHttpTask
-            | EasyHttpWrappedPage ->
-                Cmd.ofMsg LaunchEasyHttpWrappedTask
-            | DirectClientPage ->
-                Cmd.ofMsg LaunchDirectClientTask
-            | DynamicTaskPage ->
-                Cmd.ofMsg LaunchDynamicTask
-            | SendDirectPage ->
-                Cmd.ofMsg LaunchSendDirectTask
+                Cmd.ofMsg LaunchBreakingTask
             | _ ->
                 Cmd.none
         { model with
             page = page
             pageText = ""
         }, nextCmd
-    | LaunchEasyHttpTask ->
-        model, Cmd.OfTask.either model.api.test () (string >> SetText) (string >> SetText)
-    | LaunchEasyHttpWrappedTask ->
-        model, Cmd.OfTask.either (fun () -> task { return! model.api.test () }) () (string >> SetText) (string >> SetText)
-    | LaunchDirectClientTask ->
-        model, Cmd.OfTask.either directClientTask model.client (string >> SetText) (string >> SetText)
-    | LaunchDynamicTask ->
-        model, Cmd.OfTask.either dynamicallyCreatedTask () (string >> SetText) (string >> SetText)
-    | LaunchSendDirectTask ->
-        model, Cmd.OfTask.either sendDirect model.client (string >> SetText) (string >> SetText)
+    | LaunchBreakingTask ->
+        model, Cmd.OfTask.either model.breaks () (string >> SetText) (string >> SetText)
     | SetText str ->
         { model with
             pageText = str
@@ -169,11 +87,7 @@ let view model dispatch =
             text model.pageText
         ]
         p [ ] [
-            button [ on.click (fun _ -> dispatch LaunchEasyHttpTask) ] [ text "LaunchEasyHttpTask Directly" ]
-            button [ on.click (fun _ -> dispatch LaunchEasyHttpWrappedTask) ] [ text "LaunchEasyHttpWrappedTask Directly" ]
-            button [ on.click (fun _ -> dispatch LaunchDirectClientTask) ] [ text "LaunchDirectClientTask Directly" ]
-            button [ on.click (fun _ -> dispatch LaunchDynamicTask) ] [ text "LaunchDynamicTask Directly" ]
-            button [ on.click (fun _ -> dispatch LaunchSendDirectTask) ] [ text "LaunchSendDirectTask Directly" ]
+            button [ on.click (fun _ -> dispatch LaunchBreakingTask) ] [ text "LaunchBreakingTask Directly" ]
         ]
         if model.page = Home then text "blah"
         hr [ ]
@@ -181,13 +95,7 @@ let view model dispatch =
 
         // clicking this will cause an error in the console and the task result not to be sent out
         // navigating to /OtherPage directly doesn't cause this issue
-        p [ ] [ a [ router.HRef EasyHttpPage ] [ text "EasyHttpPage (breaks, error in console on FireFox)" ] ]
-
-        // not these, though?
-        p [ ] [ a [ router.HRef EasyHttpWrappedPage ] [ text "EasyHttpWrappedPage" ] ]
-        p [ ] [ a [ router.HRef DirectClientPage ] [ text "DirectClientPage" ] ]
-        p [ ] [ a [ router.HRef DynamicTaskPage ] [ text "DynamicTaskPage" ] ]
-        p [ ] [ a [ router.HRef SendDirectPage ] [ text "SendDirectPage" ] ]
+        p [ ] [ a [ router.HRef EasyHttpPage ] [ text "LaunchBreakingTask (breaks, error in console on FireFox no issue Edge/Chromium)" ] ]
     ]
 
 
@@ -195,7 +103,6 @@ type MyApp() =
     inherit ProgramComponent<Model, Message>()
 
     override this.Program =
-        let hcf = this.Services.GetService<IHttpClientFactory>()
-        Program.mkProgram (fun _ -> initModel hcf) update view
+        Program.mkProgram (fun _ -> initModel) update view
         |> Program.withConsoleTrace
         |> Program.withRouter router
